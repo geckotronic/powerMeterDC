@@ -1,21 +1,22 @@
-// powerMeterDC — ESP32-C3 + ST7789V3 (1.69" 240x280 IPS, SPI)
+// powerMeterDC — ESP32-C3 + Waveshare Pico-ePaper-2.13 (250x122 BW) + INA226
 //
-// Dashboard UI: header with status, three metric cards (voltage, current,
-// power) with icon, big value and a scrolling sparkline, and a footer with
-// load, chip temperature and uptime.
+// Dashboard UI on a 2-color e-paper: big power value with charge/discharge
+// arrows, voltage and current row, and a footer with uptime, battery SoC
+// and chip temperature. The panel only refreshes when the displayed text
+// actually changes: fast partial updates normally, with a full refresh at
+// boot and every FULL_REFRESH_MS to clear ghosting.
 //
-// Hardware: ESP32-C3 module wired directly to the TFT plus an INA226
-// current/voltage monitor on I2C. Voltage/current come from the INA226 when
-// present (simulated sweep otherwise, so the UI works on a bare bench).
-// Temperature is the ESP32-C3 internal sensor; time is uptime (no RTC).
+// Hardware: ESP32-C3 module + Waveshare Pico-ePaper-2.13 (SSD1680 class,
+// 250x122) + INA226 current/voltage monitor on I2C. Temperature is the
+// ESP32-C3 internal sensor.
 //
-// Display wiring:
-//   TFT SCL/SCK  -> GPIO4
-//   TFT SDA/MOSI -> GPIO3
-//   TFT RES/RST  -> GPIO2
-//   TFT DC       -> GPIO5
-//   TFT CS       -> GPIO6
-//   TFT BLK      -> 3V3 (always on)
+// Display wiring (SPI + control):
+//   EPD DIN  -> GPIO4   (MOSI)
+//   EPD CLK  -> GPIO3   (SCK)
+//   EPD CS   -> GPIO2
+//   EPD DC   -> GPIO1
+//   EPD RST  -> GPIO5
+//   EPD BUSY -> GPIO6
 //   VCC 3V3, GND common.
 //
 // INA226 wiring (I2C, orientation auto-probed at boot):
@@ -23,35 +24,35 @@
 //   INA226 SCL -> GPIO7
 //   Address auto-detected at boot (0x40..0x4F depending on module straps).
 //   Shunt: SHUNT_PARALLEL_N identical R100 resistors stacked in parallel.
-//
-// Uses Adafruit ST7789 (standard SPI API) instead of TFT_eSPI: TFT_eSPI
-// 2.5.43 writes raw SPI registers and crashes on ESP32-C3 with esp32 core
-// 3.x (REG_SPI_BASE(SPI2_HOST) resolves to address 0 -> store access fault).
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+#include <GxEPD2_BW.h>
 #include <SPI.h>
 #include <Wire.h>
 
 // JetBrains Mono Bold — modern monospace — converted to GFXfont with
 // Adafruit's fontconvert (see fonts/JetBrainsMono-Bold.ttf). Monospace keeps
 // digits from shifting as values change. Custom fonts render from the
-// BASELINE and ignore the background color; the classic 5x7 font stays for
-// chart axis micro-labels.
+// BASELINE and ignore the background color.
 #include "fonts/JetBrains32pt.h"
 #include "fonts/JetBrains18pt.h"
 #include "fonts/JetBrains11pt.h"  // charset 32..176 so it carries the degree sign
-#include "icons.h"
 #define FONT_HERO JetBrainsMono_Bold32pt7b
 #define FONT_VALUE JetBrainsMono_Bold18pt7b
 #define FONT_FOOT JetBrainsMono_Bold11pt8b
 
-// Pin assignments
-constexpr int8_t PIN_SCK = 4;
-constexpr int8_t PIN_MOSI = 3;
-constexpr int8_t PIN_RST = 2;
-constexpr int8_t PIN_DC = 5;
-constexpr int8_t PIN_CS = 6;
+// E-paper pin assignments
+constexpr int8_t PIN_DIN = 4;   // MOSI
+constexpr int8_t PIN_CLK = 3;   // SCK
+constexpr int8_t PIN_CS = 2;
+constexpr int8_t PIN_DC = 1;
+constexpr int8_t PIN_RST = 5;
+constexpr int8_t PIN_BUSY = 6;
+
+// 2.13" 250x122 SSD1680-class panel with fast partial update. If a
+// different panel revision stays blank here, try GxEPD2_213_B74 or
+// GxEPD2_213_B73 as the driver class.
+GxEPD2_BW<GxEPD2_213_BN, GxEPD2_213_BN::HEIGHT> epd(
+    GxEPD2_213_BN(PIN_CS, PIN_DC, PIN_RST, PIN_BUSY));
 
 // INA226 on I2C. The ESP32-C3 GPIO matrix allows any pin pair, and init
 // probes both orientations, so a swapped SDA/SCL self-corrects.
@@ -65,55 +66,18 @@ constexpr float SHUNT_OHMS = 0.100f / SHUNT_PARALLEL_N;
 constexpr float SHUNT_FS_VOLTS = 0.08192f;
 constexpr float I_FS = SHUNT_FS_VOLTS / SHUNT_OHMS;  // ~2.46 A with N=3
 
-// Panel geometry (1.69" ST7789V3; the library centers the 240x280 window
-// in the controller's 240x320 RAM automatically)
-constexpr uint16_t TFT_W = 240;
-constexpr uint16_t TFT_H = 280;
-
-Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, PIN_CS, PIN_DC, PIN_RST);
-
-// Full-screen canvas: the whole frame is rendered in RAM and pushed in one
-// blit, so periodic refreshes never flicker (240x280x2 = ~131 KB heap).
-GFXcanvas16 frame(TFT_W, TFT_H);
-
-// Palette (RGB565)
-constexpr uint16_t COL_BG = 0x0021;        // near-black navy
-constexpr uint16_t COL_CARD = 0x0861;      // card fill
-constexpr uint16_t COL_TEXT = 0xFFFF;
-constexpr uint16_t COL_MUTED = 0x8C51;     // gray labels
-constexpr uint16_t COL_GRID = 0x2124;      // chart grid / dividers
-constexpr uint16_t COL_RED = 0xF800;
-constexpr uint16_t COL_CYAN = 0x07FF, COL_CYAN_DIM = 0x0208;
-constexpr uint16_t COL_YELLOW = 0xFFE0, COL_YELLOW_DIM = 0x4200;
-constexpr uint16_t COL_GREEN = 0x07E0, COL_GREEN_DIM = 0x0200;
-
-constexpr uint32_t REFRESH_MS = 200;
-uint32_t lastRefresh = 0;
-
-// Sparkline history: ring buffer per metric, one sample per refresh,
-// so the chart spans roughly HIST_N * REFRESH_MS of history.
-constexpr uint8_t HIST_N = 27;
-struct Metric {
-  float hist[HIST_N] = {};
-  uint8_t head = 0;
-  void push(float v) {
-    hist[head] = v;
-    head = (head + 1) % HIST_N;
-  }
-};
-Metric histVolts, histAmps, histWatts;
-
-// Panel glass: the rounded corners intrude ~GLASS_CORNER_R px into the
-// active area, so edge content is inset — header text starts at (16, 8),
-// the hero chart and strip stay in mid-screen rows, and the footer band
-// lives in y 250..274 with x 8..226.
-constexpr int16_t GLASS_CORNER_R = 28;
-
-// Chart axis labels: top, middle, bottom. The power chart is symmetric
-// around zero (charge above, discharge below) with unsigned labels; the
-// full-scale label is formatted at boot from the sensor's real ceiling.
-char axisWLabel[8] = "";
-const char *AXIS_W[3] = {axisWLabel, "0", axisWLabel};
+// Refresh policy. E-paper updates are slow and visually busy, so readings
+// are sampled every second and the panel redraws only when a displayed
+// string changed, using fast partial updates. A full refresh runs at boot
+// and again every FULL_REFRESH_MS of uptime (millis-based) to clear
+// accumulated ghosting.
+constexpr uint32_t SAMPLE_MS = 1000;
+constexpr uint32_t FULL_REFRESH_MS = 10UL * 60UL * 1000UL;  // 10 minutes
+uint32_t lastSample = 0;
+uint32_t lastFullRefresh = 0;
+bool firstDraw = true;
+bool colonVisible = true;
+char lastShown[64] = "";
 
 // --- Battery model: 4S LiFePO4 pack (EVE IFR40135, 3.2 V 20 Ah 64 Wh/cell) ---
 // Datasheet: charge CC/CV to 3.65 V/cell, end of discharge 2.5 V/cell.
@@ -122,12 +86,6 @@ const char *AXIS_W[3] = {axisWLabel, "0", axisWLabel};
 // tables compensate hysteresis and typical IR shift; values are per cell,
 // linearly interpolated. Coulomb counting (INA226) will refine this later.
 constexpr float PACK_CELLS = 4.0f;
-constexpr float PACK_V_MAX = PACK_CELLS * 3.65f;  // CC/CV charge limit
-
-// Power chart full scale: the highest power the sensor can actually report
-// (shunt full-scale current at the pack's top voltage), so the trace clips
-// exactly where the measurement does.
-constexpr float PCHART_MAX = I_FS * PACK_V_MAX;  // ~36 W with N=3
 
 struct SocPoint {
   float v;    // cell terminal voltage
@@ -171,12 +129,14 @@ constexpr uint8_t INA_REG_MFG_ID = 0xFE;  // reads 0x5449 ("TI")
 constexpr uint8_t INA_REG_DIE_ID = 0xFF;  // reads 0x2260 on an INA226
 
 // 16-sample averaging, 1.1 ms conversions, continuous shunt+bus mode:
-// a fresh averaged reading every ~35 ms, well inside the 200 ms refresh.
+// a fresh averaged reading every ~35 ms, well inside the sampling period.
 constexpr uint16_t INA_CONFIG = 0x4527;
 
 // UI development aid: when true and no INA226 answers, readings fall back
-// to a simulated sweep instead of reporting ERROR.
-constexpr bool SIM_WHEN_ABSENT = false;
+// to a simulated sweep instead of reporting ERROR. Enabled while the new
+// display is being adjusted with the sensor disconnected — set back to
+// false for deployment.
+constexpr bool SIM_WHEN_ABSENT = true;
 
 bool inaPresent = false;
 bool inaError = false;       // an I2C transaction failed this refresh cycle
@@ -268,204 +228,156 @@ float readCurrent() {
   return 0.0f;
 }
 
-void drawTextRightAligned(const char *s, int16_t xRight, int16_t y) {
-  frame.setCursor(xRight - (int16_t)strlen(s) * 6, y);
-  frame.print(s);
+// Up or down triangle beside the hero value; filled when it is the active
+// flow direction, outline otherwise.
+constexpr int16_t ARROW_W = 16, ARROW_H = 14, ARROW_GAP = 12;
+void drawArrow(int16_t x, int16_t y, bool up, bool filled) {
+  int16_t yBase = up ? y + ARROW_H : y;
+  int16_t yTip = up ? y : y + ARROW_H;
+  if (filled)
+    epd.fillTriangle(x + ARROW_W / 2, yTip, x, yBase, x + ARROW_W, yBase,
+                     GxEPD_BLACK);
+  else
+    epd.drawTriangle(x + ARROW_W / 2, yTip, x, yBase, x + ARROW_W, yBase,
+                     GxEPD_BLACK);
 }
 
-// Sparkline with grid, highlighted zero baseline (wherever v=0 maps in the
-// vmin..vmax range) and area filled from that baseline.
-void drawChart(int16_t px, int16_t py, int16_t w, int16_t h,
-               const Metric &m, float vmin, float vmax, const char *axis[3],
-               uint16_t accent, uint16_t dim) {
-  int16_t y0 = py + (int16_t)(vmax / (vmax - vmin) * h);  // zero baseline
-  for (uint8_t i = 0; i < 5; i++) {
-    int16_t gy = py + (h * i) / 4;
-    frame.drawFastHLine(px, gy, w, COL_GRID);
-  }
-  frame.drawFastHLine(px, y0, w, COL_MUTED);
-  frame.setTextSize(1);
-  frame.setTextColor(COL_MUTED);
-  drawTextRightAligned(axis[0], px - 5, py - 3);
-  drawTextRightAligned(axis[1], px - 5, py + h / 2 - 3);
-  drawTextRightAligned(axis[2], px - 5, py + h - 3);
+// Layout (landscape 250x122, black on white):
+//   hero watts + charge (up) / discharge (down) arrows, baseline 48
+//   voltage left / current right, baseline 92
+//   uptime + SoC left, temperature right, baseline 119
+void updateDisplay(float volts, float amps, float watts) {
+  char hero[8], vTxt[8], aTxt[8], foot[24], tempTxt[12];
 
-  float step = (float)w / (HIST_N - 1);
-  int16_t prevX = 0, prevY = 0;
-  for (uint8_t i = 0; i < HIST_N; i++) {
-    float v = m.hist[(m.head + i) % HIST_N];  // oldest to newest
-    v = constrain(v, vmin, vmax);
-    int16_t sx = px + (int16_t)(i * step);
-    int16_t sy = py + (int16_t)((vmax - v) / (vmax - vmin) * h);
-    if (i > 0) {
-      for (int16_t x = prevX; x <= sx; x++) {  // fill toward the baseline
-        int16_t yy = prevY + (sy - prevY) * (x - prevX) / (sx - prevX);
-        if (yy <= y0)
-          frame.drawFastVLine(x, yy, y0 - yy + 1, dim);
-        else
-          frame.drawFastVLine(x, y0, yy - y0 + 1, dim);
-      }
-      frame.drawLine(prevX, prevY, sx, sy, accent);
-    }
-    prevX = sx;
-    prevY = sy;
-  }
-}
-
-// Lightning bolt glyph for the power card icon
-void drawBolt(int16_t cx, int16_t cy, uint16_t color) {
-  frame.fillTriangle(cx + 5, cy - 11, cx - 6, cy + 3, cx + 1, cy + 3, color);
-  frame.fillTriangle(cx - 5, cy + 11, cx + 6, cy - 3, cx - 1, cy - 3, color);
-}
-
-// Centered text row inside one of the two bottom panels (114 px wide)
-void drawPanelText(int16_t x, int16_t baseline, const char *text,
-                   uint16_t color) {
-  int16_t bx, by;
-  uint16_t bw, bh;
-  frame.setFont(&FONT_VALUE);
-  frame.setTextColor(color);
-  frame.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
-  frame.setCursor(x + (114 - (int16_t)bw) / 2, baseline);
-  frame.print(text);
-  frame.setFont();
-}
-
-// Temperature and uptime only, no icons; the time colon blinks each second.
-// Raised and inset so the panel's rounded corners don't clip it.
-void drawFooter() {
-  constexpr int16_t y = 250;
-  frame.setFont(&FONT_FOOT);
-  frame.setTextSize(1);
-  frame.setTextColor(COL_TEXT);
-
-  // centered row: temp value, thermo icon, small gap, hourglass icon, time
-  char tempText[12];
-  snprintf(tempText, sizeof(tempText), "%04.1f\xB0" "C", temperatureRead());
-
-  uint32_t secs = millis() / 1000;
-  unsigned long hh = secs / 3600, mm = secs / 60 % 60;
-  char timeText[12];
-  snprintf(timeText, sizeof(timeText), "%03lu:%02lu", hh, mm);
-
-  int16_t bx, by;
-  uint16_t tw, th, uw, uh;
-  frame.getTextBounds(tempText, 0, 0, &bx, &by, &tw, &th);
-  frame.getTextBounds(timeText, 0, 0, &bx, &by, &uw, &uh);
-  int16_t x = (TFT_W - ((int16_t)tw + 60 + (int16_t)uw)) / 2;
-
-  frame.setCursor(x, y + 20);
-  frame.print(tempText);
-  frame.drawRGBBitmap(x + tw + 4, y + 1, ICON_TEMP, 22, 22);
-  frame.drawRGBBitmap(x + tw + 34, y + 1, ICON_TIME, 22, 22);
-
-  if (secs % 2) {  // blink the colon
-    char *colon = strchr(timeText, ':');
-    if (colon) *colon = ' ';
-  }
-  frame.setCursor(x + tw + 60, y + 20);
-  frame.print(timeText);
-  frame.setFont();
-}
-
-// Focus layout: power is the hero metric — big centered value with flow
-// arrows, full-width trend — and voltage/current in a strip below.
-void drawDashboard(float volts, float amps, float watts) {
-  frame.fillScreen(COL_BG);
-
-  // hero value, centered, magnitude only. ERROR when the sensor stopped
-  // answering, OVLD when the shunt ADC clips: in both cases the number it
-  // would show is not the real measurement.
-  char text[8];
+  // ERROR when the sensor stopped answering, OVLD when the shunt ADC
+  // clips: in both cases the number it would show is not a measurement.
   bool fault = inaError || shuntOverload;
   if (inaError)
-    snprintf(text, sizeof(text), "ERROR");
+    strlcpy(hero, "ERROR", sizeof(hero));
   else if (shuntOverload)
-    snprintf(text, sizeof(text), "OVLD");
+    strlcpy(hero, "OVLD", sizeof(hero));
   else
-    snprintf(text, sizeof(text), "%04.1f%c", fabsf(watts), 'W');
-  frame.setFont(&FONT_HERO);
-  frame.setTextColor(fault ? COL_RED : COL_GREEN);
-  int16_t bx, by;
-  uint16_t bw, bh;
-  frame.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
-  frame.setCursor((TFT_W - (int16_t)bw) / 2, 56);
-  frame.print(text);
-  frame.setFont();
+    snprintf(hero, sizeof(hero), "%04.1fW", fabsf(watts));
 
-  // full-width power trend
-  drawChart(28, 68, 204, 88, histWatts, -PCHART_MAX, PCHART_MAX, AXIS_W,
-            COL_GREEN, COL_GREEN_DIM);
+  snprintf(vTxt, sizeof(vTxt), "%04.1fV", volts);
+  snprintf(aTxt, sizeof(aTxt), "%04.1fA", fabsf(amps));
 
-  // left column: voltage and current
-  frame.fillRoundRect(4, 164, 114, 80, 8, COL_CARD);
-  snprintf(text, sizeof(text), "%04.1fV", volts);
-  drawPanelText(4, 196, text, COL_CYAN);
-  snprintf(text, sizeof(text), "%04.1fA", fabsf(amps));
-  drawPanelText(4, 236, text, COL_YELLOW);
-
-  // right column: charge state and battery level (voltage-based SoC)
-  frame.fillRoundRect(122, 164, 114, 80, 8, COL_CARD);
-  // below 0.1 A the pack is effectively at rest: show IDLE instead of a
-  // flow direction; charging still selects the SoC table
+  // below 0.1 A the pack is effectively at rest: neither arrow is filled;
+  // charging still selects the SoC table
   bool charging = amps < -0.01f;
   bool idle = fabsf(amps) < 0.1f;
-  drawPanelText(122, 196, idle ? "IDLE" : (charging ? "CHARG" : "DISCH"),
-                idle ? COL_TEXT : (charging ? COL_GREEN : COL_RED));
-  snprintf(text, sizeof(text), "%3.0f%%", batterySoc(volts, charging));
-  drawPanelText(122, 236, text, COL_TEXT);
 
-  drawFooter();
-  tft.drawRGBBitmap(0, 0, frame.getBuffer(), TFT_W, TFT_H);
+  uint32_t secs = millis() / 1000;
+  snprintf(foot, sizeof(foot), "%03lu:%02lu %3.0f%%",
+           (unsigned long)(secs / 3600), (unsigned long)(secs / 60 % 60),
+           batterySoc(volts, charging));
+
+  // temperature rounded to 0.5 C so sensor jitter does not force a panel
+  // refresh every sample
+  snprintf(tempTxt, sizeof(tempTxt), "%04.1f\xB0" "C",
+           roundf(temperatureRead() * 2.0f) / 2.0f);
+
+  // the arrows are part of the drawn state too
+  char dir = fault ? 'F' : (idle ? 'I' : (charging ? 'C' : 'D'));
+
+  // e-paper is slow: skip the refresh entirely when nothing visible
+  // changed, unless the periodic cleanse is due
+  char shown[64];
+  snprintf(shown, sizeof(shown), "%s|%s|%s|%s|%s|%c", hero, vTxt, aTxt,
+           foot, tempTxt, dir);
+  bool full = firstDraw || millis() - lastFullRefresh >= FULL_REFRESH_MS;
+  if (!full && strcmp(shown, lastShown) == 0) return;
+  strlcpy(lastShown, shown, sizeof(lastShown));
+  firstDraw = false;
+
+  if (full) {
+    lastFullRefresh = millis();
+    epd.setFullWindow();
+  } else {
+    epd.setPartialWindow(0, 0, epd.width(), epd.height());
+  }
+
+  // the clock colon blinks on every refresh actually performed — display
+  // activity feedback, not a timebase — so it is toggled only after the
+  // redraw decision and stays out of the change-detection string
+  colonVisible = !colonVisible;
+  if (!colonVisible) {
+    char *colon = strchr(foot, ':');
+    if (colon) *colon = ' ';
+  }
+
+  int16_t w = epd.width();
+  epd.firstPage();
+  do {
+    epd.fillScreen(GxEPD_WHITE);
+    epd.setTextColor(GxEPD_BLACK);
+    int16_t bx, by;
+    uint16_t bw, bh;
+
+    // hero group (value + arrow column) centered as a unit
+    epd.setFont(&FONT_HERO);
+    epd.getTextBounds(hero, 0, 0, &bx, &by, &bw, &bh);
+    int16_t group = (int16_t)bw + (fault ? 0 : ARROW_GAP + ARROW_W);
+    int16_t hx = (w - group) / 2 - bx;
+    epd.setCursor(hx, 48);
+    epd.print(hero);
+    if (!fault) {
+      int16_t ax = hx + bx + (int16_t)bw + ARROW_GAP;
+      drawArrow(ax, 9, true, !idle && charging);      // up = charge
+      drawArrow(ax, 29, false, !idle && !charging);   // down = discharge
+    }
+
+    epd.setFont(&FONT_VALUE);
+    epd.setCursor(8, 92);
+    epd.print(vTxt);
+    epd.getTextBounds(aTxt, 0, 0, &bx, &by, &bw, &bh);
+    epd.setCursor(w - 8 - (int16_t)bw - bx, 92);
+    epd.print(aTxt);
+
+    epd.setFont(&FONT_FOOT);
+    epd.setCursor(8, 119);
+    epd.print(foot);
+    epd.getTextBounds(tempTxt, 0, 0, &bx, &by, &bw, &bh);
+    epd.setCursor(w - 8 - (int16_t)bw - bx, 119);
+    epd.print(tempTxt);
+  } while (epd.nextPage());
 }
 
 void setup() {
   Serial.begin(115200);
 
-  SPI.begin(PIN_SCK, -1 /* no MISO */, PIN_MOSI, PIN_CS);
-  tft.init(TFT_W, TFT_H);
-  tft.setSPISpeed(40000000);
-  tft.setRotation(2);  // portrait, connector at the top
-
-  if (!frame.getBuffer()) {
-    Serial.println("ERROR: frame canvas allocation failed");
-    while (true) delay(1000);
-  }
+  SPI.begin(PIN_CLK, -1 /* no MISO */, PIN_DIN, PIN_CS);
+  epd.init(115200);
+  epd.setRotation(3);  // landscape, 250x122, flex cable on the right
 
   inaPresent = inaInit();
   if (!inaPresent) Serial.println("INA226 not found");
-  snprintf(axisWLabel, sizeof(axisWLabel), "%.0f", PCHART_MAX);
 
   Serial.println("powerMeterDC: display initialized");
 }
 
 void loop() {
-  if (millis() - lastRefresh >= REFRESH_MS) {
-    lastRefresh = millis();
+  if (millis() - lastSample < SAMPLE_MS) return;
+  lastSample = millis();
 
-    // silent reconnect attempt so plugging the sensor back recovers the
-    // meter without a reboot
-    if (!inaPresent && millis() - lastInaRetry >= 2000) {
-      lastInaRetry = millis();
-      inaPresent = inaInit();
-    }
-
-    inaError = false;  // re-evaluated by this cycle's reads
-    float volts = readVoltage();
-    float amps = readCurrent();
-    float watts = volts * amps;
-    histVolts.push(volts);
-    histAmps.push(amps);
-    // chart convention: charge rises above zero, discharge dips below,
-    // same color either way (positive current = discharge)
-    histWatts.push(-watts);
-
-    drawDashboard(volts, amps, watts);
-    if (inaPresent)
-      Serial.printf("V=%.2f  I=%.2f  P=%.2f  [INA 0x%02X SDA=%d SCL=%d]\n",
-                    volts, amps, watts, inaAddr, inaSdaPin, inaSclPin);
-    else
-      Serial.printf("V=%.2f  I=%.2f  P=%.2f  [scan: %s]\n", volts, amps,
-                    watts, inaDiag);
+  // silent reconnect attempt so plugging the sensor back recovers the
+  // meter without a reboot
+  if (!inaPresent && millis() - lastInaRetry >= 2000) {
+    lastInaRetry = millis();
+    inaPresent = inaInit();
   }
+
+  inaError = false;  // re-evaluated by this cycle's reads
+  float volts = readVoltage();
+  float amps = readCurrent();
+  float watts = volts * amps;
+
+  updateDisplay(volts, amps, watts);
+
+  if (inaPresent)
+    Serial.printf("V=%.2f  I=%.2f  P=%.2f  [INA 0x%02X SDA=%d SCL=%d]\n",
+                  volts, amps, watts, inaAddr, inaSdaPin, inaSclPin);
+  else
+    Serial.printf("V=%.2f  I=%.2f  P=%.2f  [scan: %s]\n", volts, amps, watts,
+                  inaDiag);
 }
